@@ -17,7 +17,6 @@ from collections import deque
 import resend
 from openai import OpenAI
 
-# PDF Generation Imports
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
@@ -29,7 +28,6 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# Ensure sessions work across domains if frontend/backend are separated
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-prod')
 app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_COOKIE_SECURE'] = True
@@ -37,11 +35,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///mp3audio.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 CORS(app, supports_credentials=True, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
-    }
+    r"/*": { "origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"] }
 })
 
 db = SQLAlchemy(app)
@@ -59,73 +53,64 @@ with app.app_context():
 
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+try: client = OpenAI()
+except: client = None
 
-try:
-    client = OpenAI()
-except Exception as e:
-    logger.warning(f"OpenAI client could not be initialized. Check OPENAI_API_KEY: {e}")
-    client = None
-
-# CONFIGURATION
 MAX_SONGS = 50
 AVG_TIME_PER_TRACK = 45  
 PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://mp3aud.io')
 
-# GLOBAL STATE
 conversion_jobs = {} 
 zip_locks = {}
 conversion_queue = deque() 
 current_processing_session = None 
 
-# --- UTILITIES ---
-def cleanup_memory():
-    gc.collect()
+def cleanup_memory(): gc.collect()
 
 def cleanup_old_sessions():
     try:
         current_time = time.time()
         for session_id in list(conversion_jobs.keys()):
             job = conversion_jobs[session_id]
-            if job['status'] in ['processing', 'queued']:
-                continue
-            if current_time - job.get('last_update', 0) > 3600:
+            if job['status'] not in ['processing', 'queued'] and current_time - job.get('last_update', 0) > 3600:
                 session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
-                if os.path.exists(session_dir):
-                    shutil.rmtree(session_dir, ignore_errors=True)
+                if os.path.exists(session_dir): shutil.rmtree(session_dir, ignore_errors=True)
                 del conversion_jobs[session_id]
-                if session_id in zip_locks:
-                    del zip_locks[session_id]
-    except:
-        pass
+                if session_id in zip_locks: del zip_locks[session_id]
+    except: pass
 
 def send_email_notification(recipient, subject, html_content):
     try:
         resend.api_key = os.environ.get('RESEND_API_KEY')
-        from_email = os.environ.get('FROM_EMAIL') 
-        
-        if not resend.api_key or not from_email:
-            logger.warning("Resend keys missing. Email not sent.")
-            return
-
-        params = {
-            "from": f"MP3 Audio Tools <{from_email}>",
+        resend.Emails.send({
+            "from": f"MP3 Audio Tools <{os.environ.get('FROM_EMAIL')}>",
             "to": [recipient],
             "subject": subject,
             "html": html_content,
-        }
-        resend.Emails.send(params)
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+        })
+    except: pass
 
-# --- AUTHENTICATION ROUTES ---
+
+# --- GHOST USER MANAGEMENT ---
+def get_or_create_user():
+    if 'user_id' in session:
+        user = User.query.get(session['user_id'])
+        if user: return user
+        
+    fake_email = f"anon_{uuid.uuid4().hex[:12]}@guest.local"
+    ghost_user = User(email=fake_email)
+    db.session.add(ghost_user)
+    db.session.commit()
+    session['user_id'] = ghost_user.id
+    return ghost_user
+
+
+# --- AUTHENTICATION ROUTES (UPDATED SEAMLESS LOGIC) ---
 @app.route('/auth/login', methods=['POST'])
 def send_magic_link():
-    data = request.json
-    email = data.get('email', '').strip().lower()
-    
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
+    email = request.json.get('email', '').strip().lower()
+    if not email: return jsonify({"error": "Email is required"}), 400
         
     user = User.query.filter_by(email=email).first()
     if not user:
@@ -134,43 +119,38 @@ def send_magic_link():
         db.session.commit()
         
     token = serializer.dumps(email, salt='magic-link')
-    magic_url = url_for('verify_magic_link', token=token, _external=True)
     
-    html = f"""
-    <div style="font-family: Arial, sans-serif; padding: 20px;">
-        <h2>Login to mp3aud.io</h2>
-        <p>Click the button below to securely log into your account. This link expires in 1 hour.</p>
-        <a href="{magic_url}" style="background-color: #007BFF; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">Log In Now</a>
-    </div>
-    """
+    # Points the email link directly to the frontend
+    magic_url = f"{FRONTEND_URL}?token={token}"
+    
+    html = f"""<div style="padding: 20px;"><h2>Login to mp3aud.io</h2><a href="{magic_url}" style="background-color: #007BFF; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; display: inline-block;">Log In Now</a></div>"""
     send_email_notification(email, "Your Login Link", html)
-    
     return jsonify({"success": True, "message": "Magic link sent to your email."})
 
-@app.route('/auth/verify/<token>')
-def verify_magic_link(token):
-    try:
+@app.route('/auth/verify', methods=['POST'])
+def verify_magic_link():
+    token = request.json.get('token')
+    if not token: return jsonify({"error": "No token provided"}), 400
+    
+    try: 
         email = serializer.loads(token, salt='magic-link', max_age=3600)
-    except (SignatureExpired, BadSignature):
-        return redirect(f"{FRONTEND_URL}?error=invalid_link")
+    except: 
+        return jsonify({"error": "Invalid or expired link"}), 400
         
     user = User.query.filter_by(email=email).first()
     if user:
         session['user_id'] = user.id
-        return redirect(f"{FRONTEND_URL}?login=success")
+        return jsonify({"success": True})
         
-    return redirect(f"{FRONTEND_URL}?error=user_not_found")
+    return jsonify({"error": "User not found"}), 404
 
 @app.route('/auth/me', methods=['GET'])
 def get_current_user():
-    user_id = session.get('user_id')
-    if not user_id:
-        return jsonify({"authenticated": False}), 401
-        
-    user = User.query.get(user_id)
+    user = get_or_create_user()
+    is_guest = user.email.startswith('anon_')
     return jsonify({
-        "authenticated": True,
-        "email": user.email,
+        "authenticated": not is_guest,
+        "email": None if is_guest else user.email,
         "free_conversions_used": user.free_conversions_used,
         "paid_track_credits": user.paid_track_credits
     })
@@ -184,54 +164,36 @@ def logout():
 # --- PAYMENT ROUTES ---
 @app.route('/buy-credits', methods=['POST'])
 def generate_invoice():
-    user_id = session.get('user_id')
-    if not user_id:
-        return jsonify({"error": "Unauthorized"}), 401
+    user = get_or_create_user()
+    if user.email.startswith('anon_'):
+        return jsonify({"error": "Unauthorized. Please log in first."}), 401
         
-    headers = {
-        'x-api-key': os.environ.get('NOWPAYMENTS_API_KEY'),
-        'Content-Type': 'application/json'
-    }
-    
     payload = {
         "price_amount": 2.00,
         "price_currency": "usd",
-        "order_id": str(user_id), 
+        "order_id": str(user.id), 
         "order_description": "100 Track Conversions",
         "ipn_callback_url": f"{PUBLIC_URL.rstrip('/')}/webhook/nowpayments"
     }
-    
     try:
-        # Use api.sandbox.nowpayments.io for testing, api.nowpayments.io for production
-        api_url = 'https://api.nowpayments.io/v1/invoice' 
-        response = requests.post(api_url, headers=headers, json=payload)
-        
-        if response.status_code == 200:
-            return jsonify({"invoice_url": response.json().get('invoice_url')})
-        else:
-            return jsonify({"error": "Failed to connect to payment gateway."}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        headers = {'x-api-key': os.environ.get('NOWPAYMENTS_API_KEY'), 'Content-Type': 'application/json'}
+        response = requests.post('https://api.nowpayments.io/v1/invoice', headers=headers, json=payload)
+        if response.status_code == 200: return jsonify({"invoice_url": response.json().get('invoice_url')})
+        return jsonify({"error": "Failed to connect to payment gateway."}), 500
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route('/webhook/nowpayments', methods=['POST'])
 def nowpayments_webhook():
-    received_signature = request.headers.get('x-nowpayments-sig')
-    request_data = request.get_data()
-    
     secret_key = os.environ.get('NOWPAYMENTS_IPN_SECRET', '').encode('utf-8')
-    calculated_signature = hmac.new(secret_key, request_data, hashlib.sha512).hexdigest()
-    
-    if received_signature != calculated_signature:
+    if request.headers.get('x-nowpayments-sig') != hmac.new(secret_key, request.get_data(), hashlib.sha512).hexdigest():
         return jsonify({"error": "Invalid Signature"}), 403
 
     data = request.json
     if data and data.get('payment_status') == 'finished':
-        user_id = int(data.get('order_id'))
-        user = User.query.get(user_id)
+        user = User.query.get(int(data.get('order_id')))
         if user:
             user.paid_track_credits += 100
             db.session.commit()
-            
     return jsonify({"status": "OK"}), 200
 
 
@@ -240,14 +202,7 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
     if not user_email: return
     
     download_link = f"{PUBLIC_URL.rstrip('/')}/download/{session_id}/playlist_backup.zip"
-    
-    manuals_section = ""
-    if html_summaries:
-        manuals_section = f"""
-        <div style="margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; color: #333333; line-height: 1.6;">
-            {html_summaries}
-        </div>
-        """
+    manuals_section = f"<div style='margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0;'>{html_summaries}</div>" if html_summaries else ""
 
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
@@ -255,9 +210,7 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
         <p>Your conversion of <strong>{track_count} media file(s)</strong> has finished processing.</p>
         {manuals_section}
         <div style="margin: 30px 0; text-align: center;">
-            <a href="{download_link}" style="background-color: #ea580c; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold;">
-                Download ZIP Archive
-            </a>
+            <a href="{download_link}" style="background-color: #ea580c; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold;">Download ZIP Archive</a>
         </div>
     </div>
     """
@@ -272,12 +225,7 @@ def transcribe_audio_file(mp3_file_path, job=None):
         
         if job: job['current_status'] = 'Slicing audio for AI analysis...'
 
-        cmd = [
-            ffmpeg_exe, '-y', '-i', mp3_file_path,
-            '-f', 'segment', '-segment_time', '900',
-            '-c', 'copy', chunk_pattern
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run([ffmpeg_exe, '-y', '-i', mp3_file_path, '-f', 'segment', '-segment_time', '900', '-c', 'copy', chunk_pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         
         chunks = sorted(glob.glob(os.path.join(temp_dir, "chunk_*.mp3")))
         total_chunks = len(chunks)
@@ -292,48 +240,35 @@ def transcribe_audio_file(mp3_file_path, job=None):
                 with open(chunk_path, "rb") as audio_file:
                     transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
                 full_transcript += transcript.text + " "
-            except Exception as e:
-                full_transcript += f"\n[Warning: AI transcription failed for this segment.]\n"
+            except: full_transcript += f"\n[Warning: AI transcription failed for this segment.]\n"
         
         if job: job['sub_progress'] = 100
         shutil.rmtree(temp_dir, ignore_errors=True)
                 
         text_file_path = mp3_file_path.replace('.mp3', '.txt')
-        with open(text_file_path, "w", encoding="utf-8") as text_file:
-            text_file.write(full_transcript.strip()) 
+        with open(text_file_path, "w", encoding="utf-8") as f: f.write(full_transcript.strip()) 
             
         pdf_file_path = mp3_file_path.replace('.mp3', '.pdf')
         try:
             doc = SimpleDocTemplate(pdf_file_path, pagesize=letter)
-            styles = getSampleStyleSheet()
-            formatted_text = full_transcript.strip().replace('\n', '<br/>')
-            story = [Paragraph(formatted_text, styles["Normal"])]
+            story = [Paragraph(full_transcript.strip().replace('\n', '<br/>'), getSampleStyleSheet()["Normal"])]
             doc.build(story)
-        except:
-            pdf_file_path = None
+        except: pdf_file_path = None
             
         return text_file_path, pdf_file_path
-    except:
-        return None, None
+    except: return None, None
 
 def generate_diy_manual(transcript_text_path, job=None):
     if not client: return None, None, None
     try:
-        if job:
-            job['current_status'] = 'Formatting AI summary...'
-            job['sub_progress'] = 0
+        if job: job['current_status'] = 'Formatting AI summary...'; job['sub_progress'] = 0
 
-        with open(transcript_text_path, "r", encoding="utf-8") as file:
-            transcript = file.read()[:100000] 
-        
+        with open(transcript_text_path, "r", encoding="utf-8") as file: transcript = file.read()[:100000] 
         system_prompt = "You are an expert technical writer. Format the provided text into a highly detailed, comprehensive document in HTML format."
 
         response = client.chat.completions.create(
             model="gpt-4o", 
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Here is the raw transcript:\n\n{transcript}"}
-            ],
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Here is the raw transcript:\n\n{transcript}"}],
             temperature=0.3 
         )
         
@@ -343,19 +278,16 @@ def generate_diy_manual(transcript_text_path, job=None):
         manual_path = transcript_text_path.replace('.txt', '_summary.html')
         pdf_path = transcript_text_path.replace('.txt', '_summary.pdf')
         
-        with open(manual_path, "w", encoding="utf-8") as f:
-            f.write(manual_html)
+        with open(manual_path, "w", encoding="utf-8") as f: f.write(manual_html)
             
         try:
             with open(pdf_path, "w+b") as result_file:
                 pisa_status = pisa.CreatePDF(manual_html, dest=result_file)
             if pisa_status.err: pdf_path = None
-        except:
-            pdf_path = None
+        except: pdf_path = None
             
         return manual_path, pdf_path, manual_html
-    except:
-        return None, None, None
+    except: return None, None, None
 
 # --- AUDIO PROCESSING ---
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio):
@@ -368,20 +300,16 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'): raise Exception("CancelledByUser")
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
-            if total and d.get('downloaded_bytes'):
-                job['sub_progress'] = int((d['downloaded_bytes'] / total) * 100)
+            if total and d.get('downloaded_bytes'): job['sub_progress'] = int((d['downloaded_bytes'] / total) * 100)
             job['current_status'] = 'Downloading audio...'
         elif d['status'] == 'finished':
-            job['sub_progress'] = 100
-            job['current_status'] = 'Extracting audio...'
+            job['sub_progress'] = 100; job['current_status'] = 'Extracting audio...'
 
     ydl_opts = {
         'format': 'http_mp3_128/bestaudio[ext=mp3]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
-        'ffmpeg_location': ffmpeg_exe,
-        'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
-        'socket_timeout': 30, 'retries': 5,
-        'progress_hooks': [progress_hook],
+        'ffmpeg_location': ffmpeg_exe, 'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
+        'socket_timeout': 30, 'retries': 5, 'progress_hooks': [progress_hook],
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'}],
     }
 
@@ -397,8 +325,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['last_update'] = time.time()
         job['current_thumbnail'] = thumbnail 
         
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        with YoutubeDL(ydl_opts) as ydl: ydl.download([url])
         
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         if mp3_files:
@@ -406,8 +333,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
             
             with lock:
-                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                    z.write(file_to_zip, f"{clean_name}.mp3")
+                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z: z.write(file_to_zip, f"{clean_name}.mp3")
             
             if transcribe_audio:
                 raw_txt_path, raw_pdf_path = transcribe_audio_file(file_to_zip, job)
@@ -471,37 +397,21 @@ def worker_loop():
                 if conversion_jobs.get(sid, {}).get('cancelled'):
                     conversion_jobs[sid]['status'] = 'cancelled'
                     continue
-                run_conversion_task(
-                    sid, task_data['url'], task_data['entries'], 
-                    task_data.get('email'), task_data.get('start_time'),
-                    task_data.get('end_time'), task_data.get('transcribe_audio')
-                )
-            else:
-                time.sleep(1)
-        except:
-            time.sleep(1)
+                run_conversion_task(sid, task_data['url'], task_data['entries'], task_data.get('email'), task_data.get('start_time'), task_data.get('end_time'), task_data.get('transcribe_audio'))
+            else: time.sleep(1)
+        except: time.sleep(1)
 
 queue_worker = Thread(target=worker_loop, daemon=True)
 queue_worker.start()
 
-# --- MAIN API ROUTES ---
 @app.route('/start_conversion', methods=['POST'])
 def start_conversion():
     cleanup_old_sessions()
-    
-    # Authenticate User
-    user_id = session.get('user_id')
-    if not user_id:
-        return jsonify({"error": "Unauthorized. Please log in to process URLs."}), 401
-    
-    user = User.query.get(user_id)
+    user = get_or_create_user()
     
     data = request.json
     url = data.get('url', '').strip()
     session_id = data.get('session_id', str(uuid.uuid4()))
-    start_time = data.get('start_time', '').strip()
-    end_time = data.get('end_time', '').strip()
-    transcribe_audio = data.get('transcribe_audio', False) 
     
     if not url: return jsonify({"error": "No URL provided"}), 400
     
@@ -509,17 +419,13 @@ def start_conversion():
         with YoutubeDL({'extract_flat': True, 'quiet': True, 'playlistend': MAX_SONGS, 'nocheckcertificate': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             entries = info.get('entries', [info]) if info else []
-            
             valid_entries = []
             for i, e in enumerate(entries[:MAX_SONGS]):
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    if not track_url.startswith('http') and 'soundcloud' in url: 
-                        track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
-                    elif not track_url.startswith('http'):
-                        continue 
-                    thumbnail = e.get('thumbnail', info.get('thumbnail', ''))
-                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), thumbnail))
+                    if not track_url.startswith('http') and 'soundcloud' in url: track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
+                    elif not track_url.startswith('http'): continue 
+                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), e.get('thumbnail', '')))
             
             total_tracks = len(valid_entries)
 
@@ -534,35 +440,24 @@ def start_conversion():
             db.session.commit()
         else:
             return jsonify({
-                "error": f"Limit reached. You requested {total_tracks} tracks but only have {user.paid_track_credits} credits.", 
+                "error": f"Limit reached. You requested {total_tracks} tracks but have 0 free uses and {user.paid_track_credits} credits.", 
                 "requires_payment": True
             }), 403
 
-        # Add to Queue
         conversion_jobs[session_id] = {
-            'status': 'queued', 'total': total_tracks, 'completed': 0,
-            'skipped': 0, 'current_track': 0, 'completed_tracks': [],
-            'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
-            'current_thumbnail': '', 'last_update': time.time(),
-            'email_summaries': '', 'sub_progress': 0 
+            'status': 'queued', 'total': total_tracks, 'completed': 0, 'skipped': 0, 'current_track': 0, 
+            'completed_tracks': [], 'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
+            'current_thumbnail': '', 'last_update': time.time(), 'email_summaries': '', 'sub_progress': 0 
         }
         
         conversion_queue.append({
-            'session_id': session_id,
-            'url': url,
-            'entries': valid_entries,
-            'email': user.email, # Automatically link their authenticated email
-            'start_time': start_time if start_time else None,
-            'end_time': end_time if end_time else None,
-            'transcribe_audio': transcribe_audio
+            'session_id': session_id, 'url': url, 'entries': valid_entries,
+            'email': user.email if not user.email.startswith('anon_') else None,
+            'start_time': data.get('start_time'), 'end_time': data.get('end_time'),
+            'transcribe_audio': data.get('transcribe_audio', False)
         })
         
-        return jsonify({
-            "session_id": session_id, 
-            "total_tracks": total_tracks, 
-            "status": "queued",
-            "queue_position": len(conversion_queue)
-        }), 200
+        return jsonify({"session_id": session_id, "total_tracks": total_tracks, "status": "queued", "queue_position": len(conversion_queue)}), 200
         
     except Exception as e:
         return jsonify({"error": "This URL may be protected and unsupported."}), 400
@@ -571,7 +466,6 @@ def start_conversion():
 def get_status(session_id):
     job = conversion_jobs.get(session_id)
     if not job: return jsonify({"error": "Session not found"}), 404
-    
     queue_pos, wait_seconds = 0, 0
     if job['status'] == 'queued':
         if current_processing_session and current_processing_session != session_id:
@@ -579,24 +473,14 @@ def get_status(session_id):
             if curr_job and curr_job['status'] == 'processing':
                 wait_seconds += (max(0, curr_job['total'] - curr_job['completed']) * AVG_TIME_PER_TRACK)
         for idx, item in enumerate(conversion_queue):
-            if item['session_id'] == session_id:
-                queue_pos = idx + 1
-                break
+            if item['session_id'] == session_id: queue_pos = idx + 1; break
             wait_seconds += (len(item['entries']) * AVG_TIME_PER_TRACK)
-
     return jsonify({
-        "status": job['status'], 
-        "total": job['total'], 
-        "completed": job['completed'],
-        "skipped": job['skipped'], 
-        "current_track": job['current_track'],
-        "current_status": job.get('current_status', ''), 
-        "current_thumbnail": job.get('current_thumbnail', ''),
-        "zip_ready": job.get('zip_ready', False),
-        "zip_path": job.get('zip_path', ''), 
-        "sub_progress": job.get('sub_progress', 0),
-        "queue_position": queue_pos,
-        "estimated_wait": math.ceil(wait_seconds / 60)
+        "status": job['status'], "total": job['total'], "completed": job['completed'], "skipped": job['skipped'], 
+        "current_track": job['current_track'], "current_status": job.get('current_status', ''), 
+        "current_thumbnail": job.get('current_thumbnail', ''), "zip_ready": job.get('zip_ready', False),
+        "zip_path": job.get('zip_path', ''), "sub_progress": job.get('sub_progress', 0),
+        "queue_position": queue_pos, "estimated_wait": math.ceil(wait_seconds / 60)
     }), 200
 
 @app.route('/cancel', methods=['POST'])
@@ -608,9 +492,7 @@ def cancel_conversion():
         if job['status'] == 'queued': job['status'] = 'cancelled'
         try:
             for item in list(conversion_queue):
-                if item['session_id'] == session_id:
-                    conversion_queue.remove(item)
-                    break
+                if item['session_id'] == session_id: conversion_queue.remove(item); break
         except: pass
         return jsonify({"status": "cancelling"}), 200
     return jsonify({"status": "not_found"}), 404
@@ -618,9 +500,7 @@ def cancel_conversion():
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
     file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True)
+    if os.path.exists(file_path): return send_file(file_path, as_attachment=True)
     return "File not found", 404
 
-if __name__ == '__main__':
-    app.run(debug=False, port=5000, threaded=True)
+if __name__ == '__main__': app.run(debug=False, port=5000, threaded=True)
