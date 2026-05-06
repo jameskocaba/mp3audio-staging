@@ -338,7 +338,7 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
             process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist, t_thumb, start_time, end_time, transcribe_audio)
 
         if not job.get('cancelled'):
-            # THE FIX: Ensure we actually downloaded something before calling it a success
+            # This strictly prevents generating a ZIP file if tracks failed to download
             if job['completed'] == 0:
                 job['status'] = 'error'
                 job['error'] = 'Failed to extract audio. The link may be private, unsupported, or geo-blocked.'
@@ -391,18 +391,24 @@ def start_conversion():
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
                     if not track_url.startswith('http') and 'soundcloud' in url: track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
                     elif not track_url.startswith('http'): continue 
-                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), e.get('thumbnail', '')))
+                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i+1}"), e.get('uploader', 'Artist'), e.get('thumbnail', '')))
             total_tracks = len(valid_entries)
 
-        if total_tracks == 0: return jsonify({"error": "No tracks found."}), 400
+        if total_tracks == 0: return jsonify({"error": "No tracks found or supported."}), 400
+        
+        # FIXED: Proper playlist limit tracking
         if user.paid_track_credits >= total_tracks:
             user.paid_track_credits -= total_tracks
             db.session.commit()
-        elif user.free_conversions_used < 5:
-            user.free_conversions_used += 1
+        elif user.free_conversions_used + total_tracks <= 5:
+            user.free_conversions_used += total_tracks
             db.session.commit()
         else:
-            return jsonify({"error": f"Limit reached. You requested {total_tracks} tracks but have 0 free uses and {user.paid_track_credits} credits.", "requires_payment": True}), 403
+            available_free = 5 - user.free_conversions_used
+            return jsonify({
+                "error": f"Limit reached. This playlist has {total_tracks} tracks, but you only have {available_free} free uses and {user.paid_track_credits} credits.", 
+                "requires_payment": True
+            }), 403
 
         conversion_jobs[session_id] = {
             'status': 'queued', 'total': total_tracks, 'completed': 0, 'skipped': 0, 'current_track': 0, 
@@ -434,7 +440,6 @@ def get_status(session_id):
             if item['session_id'] == session_id: queue_pos = idx + 1; break
             wait_seconds += (len(item['entries']) * AVG_TIME_PER_TRACK)
     
-    # THE FIX: Ensures errors are passed back to the frontend
     return jsonify({
         "status": job['status'], "total": job['total'], "completed": job['completed'], "skipped": job['skipped'], 
         "current_track": job['current_track'], "current_status": job.get('current_status', ''), 
@@ -464,7 +469,6 @@ def download_file(session_id, filename):
     if os.path.exists(file_path): return send_file(file_path, as_attachment=True)
     return "File not found", 404
 
-# HEALTH CHECKS
 @app.route('/health')
 def health(): return jsonify({"status": "ok"}), 200
 @app.route('/')
