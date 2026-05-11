@@ -273,74 +273,134 @@ def generate_diy_manual(transcript_text_path, job=None):
         return manual_path, pdf_path, manual_html
     except: return None, None, None
 
+# ----------- FULLY RESTORED ORIGINAL PROCESS_TRACK FUNCTION -----------
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio):
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'): return False
+
     temp_filename_base = f"track_{track_index}"
     
     def progress_hook(d):
-        if job.get('cancelled'): raise Exception("CancelledByUser")
+        if job.get('cancelled'): 
+            raise Exception("CancelledByUser")
+            
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
-            if total and d.get('downloaded_bytes'): job['sub_progress'] = int((d['downloaded_bytes'] / total) * 100)
+            if total and d.get('downloaded_bytes'):
+                job['sub_progress'] = int((d['downloaded_bytes'] / total) * 100)
             job['current_status'] = 'Downloading audio...'
         elif d['status'] == 'finished':
-            job['sub_progress'] = 100; job['current_status'] = 'Extracting audio...'
+            job['sub_progress'] = 100
+            job['current_status'] = 'Extracting audio...'
 
     ydl_opts = {
         'format': 'http_mp3_128/bestaudio[ext=mp3]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
-        'ffmpeg_location': ffmpeg_exe, 'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
-        'socket_timeout': 30, 'retries': 5, 'progress_hooks': [progress_hook],
-        'hls_prefer_native': True,
+        'ffmpeg_location': ffmpeg_exe,
+        'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
+        'socket_timeout': 30, 'retries': 5,
+        'hls_prefer_native': True, 
+        'writethumbnail': False,
+        'progress_hooks': [progress_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
-        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'}],
+        'postprocessors': [
+            {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'},
+        ],
+        'postprocessor_args': {
+            'ffmpeg': [
+                '-map_metadata', '-1', 
+                '-threads', '1',
+                '-err_detect', 'ignore_err'
+            ]
+        },
     }
 
     if start_time or end_time:
         ydl_opts['external_downloader'] = ffmpeg_exe
         ffmpeg_args = ['-y']
-        if start_time: ffmpeg_args.extend(['-ss', str(start_time)])
-        if end_time: ffmpeg_args.extend(['-to', str(end_time)])
+        if start_time:
+            ffmpeg_args.extend(['-ss', str(start_time)])
+        if end_time:
+            ffmpeg_args.extend(['-to', str(end_time)])
         ydl_opts['external_downloader_args'] = {'ffmpeg_i': ffmpeg_args}
 
     try:
         job['current_track'] = track_index
         job['last_update'] = time.time()
+        job['current_status'] = f'Initializing track {track_index}...'
+        job['sub_progress'] = 0
         job['current_thumbnail'] = thumbnail 
         
-        with YoutubeDL(ydl_opts) as ydl: ydl.download([url])
+        if job.get('cancelled'): return False
+
+        # CRITICAL RESTORATION: This fetches dynamic SC tokens before download
+        try:
+            with YoutubeDL({'quiet':True, 'no_warnings':True, 'socket_timeout':10}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info.get('title'): track_name = info['title']
+                if info.get('uploader'): artist_name = info['uploader']
+                if info.get('thumbnail'): job['current_thumbnail'] = info['thumbnail']
+        except: pass
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         if mp3_files:
             file_to_zip = mp3_files[0]
+
+            # CRITICAL RESTORATION: Manual FFmpeg metadata overwrite to fix corrupt SC files
+            try:
+                cmd = [
+                    ffmpeg_exe, '-y', '-i', file_to_zip, 
+                    '-map_metadata', '-1', 
+                    '-metadata', f'title={track_name}', 
+                    '-metadata', f'artist={artist_name}', 
+                    '-c', 'copy', file_to_zip + '.tmp'
+                ]
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if os.path.exists(file_to_zip + '.tmp'): 
+                    os.replace(file_to_zip + '.tmp', file_to_zip)
+            except: pass
+
             clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
+            
             with lock:
-                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z: z.write(file_to_zip, f"{clean_name}.mp3")
+                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
+                    z.write(file_to_zip, f"{clean_name}.mp3")
             
             if transcribe_audio:
                 raw_txt_path, raw_pdf_path = transcribe_audio_file(file_to_zip, job)
+                
                 if raw_txt_path:
                     html_path, summary_pdf_path, manual_html = generate_diy_manual(raw_txt_path, job)
+                    
                     with lock:
                         with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                            if raw_pdf_path: z.write(raw_pdf_path, f"{clean_name}_raw_transcript.pdf")
-                            if summary_pdf_path: z.write(summary_pdf_path, f"{clean_name}_summary.pdf")
+                            if raw_pdf_path and os.path.exists(raw_pdf_path): z.write(raw_pdf_path, f"{clean_name}_raw_transcript.pdf")
+                            if summary_pdf_path and os.path.exists(summary_pdf_path): z.write(summary_pdf_path, f"{clean_name}_summary.pdf")
+
                     if manual_html: job['email_summaries'] += f"<hr><h2>{clean_name}</h2>" + manual_html
 
             job['completed'] += 1
+            job['sub_progress'] = 100
             job['completed_tracks'].append(clean_name)
             return True
-    except:
+    except Exception as e:
         if not job.get('cancelled'): job['skipped'] += 1
         return False
     finally:
-        for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
-            try: os.remove(f)
-            except: pass
+        try:
+            for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
+                try: os.remove(f)
+                except: pass
+        except: pass
         cleanup_memory()
+# ----------------------------------------------------------------------
+
 
 def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None, transcribe_audio=False, user_id=None, payment_method=None):
     global current_processing_session
@@ -361,7 +421,10 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
         if not job.get('cancelled'):
             if job['completed'] == 0:
                 job['status'] = 'error'
-                job['error'] = 'Failed to extract audio. The link may be private, unsupported, or geo-blocked.'
+                job['error'] = (
+                    "Failed to extract audio. "
+                    "The link may be private, unsupported, or geo-blocked."
+                )
             else:
                 job['status'] = 'completed'
                 job['zip_ready'] = True
@@ -376,7 +439,6 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
         if session_id in zip_locks: del zip_locks[session_id]
         current_processing_session = None
         
-        # Calculate unused tracks and refund accordingly
         unused_tracks = job['total'] - job['completed']
         refund_unused_credits(user_id, payment_method, unused_tracks)
         
@@ -390,7 +452,6 @@ def worker_loop():
                 sid = task_data['session_id']
                 job = conversion_jobs.get(sid, {})
                 
-                # Check if it was cancelled while sitting in the queue
                 if job.get('cancelled'):
                     job['status'] = 'cancelled'
                     unused_tracks = job.get('total', 0) - job.get('completed', 0)
@@ -424,7 +485,9 @@ def start_conversion():
             for i, e in enumerate(entries[:MAX_SONGS]):
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    if not track_url.startswith('http') and 'soundcloud' in url: track_url = f"https://api.soundcloud.com/tracks/{e.get('id', i)}"
+                    # CRITICAL RESTORATION: Fixed fallback URL formatting
+                    if not track_url.startswith('http') and 'soundcloud' in url: 
+                        track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
                     elif not track_url.startswith('http'): continue 
                     valid_entries.append((i+1, track_url, e.get('title', f"Track {i+1}"), e.get('uploader', 'Artist'), e.get('thumbnail', '')))
             total_tracks = len(valid_entries)
