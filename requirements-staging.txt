@@ -10,3 +10,5 @@ reportlab==4.1.0
 requests==2.31.0
 Flask-SQLAlchemy==3.1.1
 itsdangerous==2.1.2
+certifi
+pycryptodomex
