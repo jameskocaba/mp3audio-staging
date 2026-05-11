@@ -6,7 +6,7 @@ gunicorn==21.2.0
 resend==0.8.0
 openai==1.13.3
 xhtml2pdf==0.2.11
-reportlab==4.1.0
+reportlab==3.6.13
 requests==2.31.0
 Flask-SQLAlchemy==3.1.1
 itsdangerous==2.1.2
