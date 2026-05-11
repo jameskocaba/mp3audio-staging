@@ -102,6 +102,21 @@ def get_or_create_user():
     session['user_id'] = ghost_user.id
     return ghost_user
 
+def refund_unused_credits(user_id, payment_method, unused_tracks):
+    """Refunds credits back to the user if tracks failed, were skipped, or cancelled."""
+    if unused_tracks > 0 and user_id and payment_method:
+        try:
+            with app.app_context():
+                user = User.query.get(user_id)
+                if user:
+                    if payment_method == 'credits':
+                        user.paid_track_credits += unused_tracks
+                    elif payment_method == 'free':
+                        user.free_conversions_used = max(0, user.free_conversions_used - unused_tracks)
+                    db.session.commit()
+        except Exception as e:
+            logger.error(f"Failed to refund credits: {e}")
+
 @app.route('/auth/login', methods=['POST'])
 def send_magic_link():
     email = request.json.get('email', '').strip().lower()
@@ -321,7 +336,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             except: pass
         cleanup_memory()
 
-def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None, transcribe_audio=False):
+def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None, transcribe_audio=False, user_id=None, payment_method=None):
     global current_processing_session
     current_processing_session = session_id
     job = conversion_jobs[session_id]
@@ -355,6 +370,11 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
     finally:
         if session_id in zip_locks: del zip_locks[session_id]
         current_processing_session = None
+        
+        # Calculate unused tracks and refund accordingly
+        unused_tracks = job['total'] - job['completed']
+        refund_unused_credits(user_id, payment_method, unused_tracks)
+        
         cleanup_memory()
 
 def worker_loop():
@@ -363,10 +383,20 @@ def worker_loop():
             if conversion_queue:
                 task_data = conversion_queue.popleft()
                 sid = task_data['session_id']
-                if conversion_jobs.get(sid, {}).get('cancelled'):
-                    conversion_jobs[sid]['status'] = 'cancelled'
+                job = conversion_jobs.get(sid, {})
+                
+                # Check if it was cancelled while sitting in the queue
+                if job.get('cancelled'):
+                    job['status'] = 'cancelled'
+                    unused_tracks = job.get('total', 0) - job.get('completed', 0)
+                    refund_unused_credits(task_data.get('user_id'), task_data.get('payment_method'), unused_tracks)
                     continue
-                run_conversion_task(sid, task_data['url'], task_data['entries'], task_data.get('email'), task_data.get('start_time'), task_data.get('end_time'), task_data.get('transcribe_audio'))
+                    
+                run_conversion_task(
+                    sid, task_data['url'], task_data['entries'], task_data.get('email'), 
+                    task_data.get('start_time'), task_data.get('end_time'), task_data.get('transcribe_audio'),
+                    task_data.get('user_id'), task_data.get('payment_method')
+                )
             else: time.sleep(1)
         except: time.sleep(1)
 
@@ -396,12 +426,15 @@ def start_conversion():
 
         if total_tracks == 0: return jsonify({"error": "No tracks found or supported."}), 400
         
-        # FIXED: Proper playlist limit tracking
+        # Deduct upfront, keeping track of what mechanism we used for potential refunds later
+        payment_method = None
         if user.paid_track_credits >= total_tracks:
             user.paid_track_credits -= total_tracks
+            payment_method = 'credits'
             db.session.commit()
         elif user.free_conversions_used + total_tracks <= 5:
             user.free_conversions_used += total_tracks
+            payment_method = 'free'
             db.session.commit()
         else:
             available_free = 5 - user.free_conversions_used
@@ -419,6 +452,7 @@ def start_conversion():
         conversion_queue.append({
             'session_id': session_id, 'url': url, 'entries': valid_entries,
             'email': user.email if not user.email.startswith('anon_') else None,
+            'user_id': user.id, 'payment_method': payment_method,
             'start_time': data.get('start_time'), 'end_time': data.get('end_time'),
             'transcribe_audio': data.get('transcribe_audio', False)
         })
@@ -456,10 +490,17 @@ def cancel_conversion():
         job = conversion_jobs[session_id]
         job['cancelled'] = True
         if job['status'] == 'queued': job['status'] = 'cancelled'
+        
+        # If it's still in the queue, remove it immediately and process the refund here
         try:
             for item in list(conversion_queue):
-                if item['session_id'] == session_id: conversion_queue.remove(item); break
+                if item['session_id'] == session_id: 
+                    conversion_queue.remove(item)
+                    unused_tracks = job['total'] - job['completed']
+                    refund_unused_credits(item.get('user_id'), item.get('payment_method'), unused_tracks)
+                    break
         except: pass
+        
         return jsonify({"status": "cancelling"}), 200
     return jsonify({"status": "not_found"}), 404
 
