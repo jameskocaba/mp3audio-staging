@@ -8,6 +8,7 @@ from flask_sqlalchemy import SQLAlchemy
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 from yt_dlp import YoutubeDL
 import json
+import requests
 
 from gevent.pool import Pool
 from gevent.lock import BoundedSemaphore
@@ -291,6 +292,11 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe, 'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
         'socket_timeout': 30, 'retries': 5, 'progress_hooks': [progress_hook],
+        'hls_prefer_native': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'}],
     }
 
@@ -353,166 +359,6 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
             process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist, t_thumb, start_time, end_time, transcribe_audio)
 
         if not job.get('cancelled'):
-            # This strictly prevents generating a ZIP file if tracks failed to download
             if job['completed'] == 0:
                 job['status'] = 'error'
-                job['error'] = 'Failed to extract audio. The link may be private, unsupported, or geo-blocked.'
-            else:
-                job['status'] = 'completed'
-                job['zip_ready'] = True
-                job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
-                if user_email: notify_user_complete(session_id, user_email, job['completed'], job.get('email_summaries', ''))
-        else:
-            job['status'] = 'cancelled'
-    except Exception as e:
-        job['status'] = 'error'
-        job['error'] = str(e)
-    finally:
-        if session_id in zip_locks: del zip_locks[session_id]
-        current_processing_session = None
-        
-        # Calculate unused tracks and refund accordingly
-        unused_tracks = job['total'] - job['completed']
-        refund_unused_credits(user_id, payment_method, unused_tracks)
-        
-        cleanup_memory()
-
-def worker_loop():
-    while True:
-        try:
-            if conversion_queue:
-                task_data = conversion_queue.popleft()
-                sid = task_data['session_id']
-                job = conversion_jobs.get(sid, {})
-                
-                # Check if it was cancelled while sitting in the queue
-                if job.get('cancelled'):
-                    job['status'] = 'cancelled'
-                    unused_tracks = job.get('total', 0) - job.get('completed', 0)
-                    refund_unused_credits(task_data.get('user_id'), task_data.get('payment_method'), unused_tracks)
-                    continue
-                    
-                run_conversion_task(
-                    sid, task_data['url'], task_data['entries'], task_data.get('email'), 
-                    task_data.get('start_time'), task_data.get('end_time'), task_data.get('transcribe_audio'),
-                    task_data.get('user_id'), task_data.get('payment_method')
-                )
-            else: time.sleep(1)
-        except: time.sleep(1)
-
-queue_worker = Thread(target=worker_loop, daemon=True)
-queue_worker.start()
-
-@app.route('/start_conversion', methods=['POST'])
-def start_conversion():
-    cleanup_old_sessions()
-    user = get_or_create_user()
-    data = request.json
-    url = data.get('url', '').strip()
-    session_id = data.get('session_id', str(uuid.uuid4()))
-    if not url: return jsonify({"error": "No URL provided"}), 400
-    try:
-        with YoutubeDL({'extract_flat': True, 'quiet': True, 'playlistend': MAX_SONGS, 'nocheckcertificate': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            entries = info.get('entries', [info]) if info else []
-            valid_entries = []
-            for i, e in enumerate(entries[:MAX_SONGS]):
-                if e:
-                    track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    if not track_url.startswith('http') and 'soundcloud' in url: track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
-                    elif not track_url.startswith('http'): continue 
-                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i+1}"), e.get('uploader', 'Artist'), e.get('thumbnail', '')))
-            total_tracks = len(valid_entries)
-
-        if total_tracks == 0: return jsonify({"error": "No tracks found or supported."}), 400
-        
-        # Deduct upfront, keeping track of what mechanism we used for potential refunds later
-        payment_method = None
-        if user.paid_track_credits >= total_tracks:
-            user.paid_track_credits -= total_tracks
-            payment_method = 'credits'
-            db.session.commit()
-        elif user.free_conversions_used + total_tracks <= 5:
-            user.free_conversions_used += total_tracks
-            payment_method = 'free'
-            db.session.commit()
-        else:
-            available_free = 5 - user.free_conversions_used
-            return jsonify({
-                "error": f"Limit reached. This playlist has {total_tracks} tracks, but you only have {available_free} free uses and {user.paid_track_credits} credits.", 
-                "requires_payment": True
-            }), 403
-
-        conversion_jobs[session_id] = {
-            'status': 'queued', 'total': total_tracks, 'completed': 0, 'skipped': 0, 'current_track': 0, 
-            'completed_tracks': [], 'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
-            'current_thumbnail': '', 'last_update': time.time(), 'email_summaries': '', 'sub_progress': 0 
-        }
-        
-        conversion_queue.append({
-            'session_id': session_id, 'url': url, 'entries': valid_entries,
-            'email': user.email if not user.email.startswith('anon_') else None,
-            'user_id': user.id, 'payment_method': payment_method,
-            'start_time': data.get('start_time'), 'end_time': data.get('end_time'),
-            'transcribe_audio': data.get('transcribe_audio', False)
-        })
-        return jsonify({"session_id": session_id, "total_tracks": total_tracks, "status": "queued", "queue_position": len(conversion_queue)}), 200
-    except Exception as e:
-        return jsonify({"error": "This URL may be protected and unsupported."}), 400
-
-@app.route('/status/<session_id>', methods=['GET'])
-def get_status(session_id):
-    job = conversion_jobs.get(session_id)
-    if not job: return jsonify({"error": "Session not found"}), 404
-    queue_pos, wait_seconds = 0, 0
-    if job['status'] == 'queued':
-        if current_processing_session and current_processing_session != session_id:
-            curr_job = conversion_jobs.get(current_processing_session)
-            if curr_job and curr_job['status'] == 'processing':
-                wait_seconds += (max(0, curr_job['total'] - curr_job['completed']) * AVG_TIME_PER_TRACK)
-        for idx, item in enumerate(conversion_queue):
-            if item['session_id'] == session_id: queue_pos = idx + 1; break
-            wait_seconds += (len(item['entries']) * AVG_TIME_PER_TRACK)
-    
-    return jsonify({
-        "status": job['status'], "total": job['total'], "completed": job['completed'], "skipped": job['skipped'], 
-        "current_track": job['current_track'], "current_status": job.get('current_status', ''), 
-        "current_thumbnail": job.get('current_thumbnail', ''), "zip_ready": job.get('zip_ready', False),
-        "zip_path": job.get('zip_path', ''), "sub_progress": job.get('sub_progress', 0),
-        "error": job.get('error', ''), 
-        "queue_position": queue_pos, "estimated_wait": math.ceil(wait_seconds / 60)
-    }), 200
-
-@app.route('/cancel', methods=['POST'])
-def cancel_conversion():
-    session_id = request.json.get('session_id')
-    if session_id in conversion_jobs:
-        job = conversion_jobs[session_id]
-        job['cancelled'] = True
-        if job['status'] == 'queued': job['status'] = 'cancelled'
-        
-        # If it's still in the queue, remove it immediately and process the refund here
-        try:
-            for item in list(conversion_queue):
-                if item['session_id'] == session_id: 
-                    conversion_queue.remove(item)
-                    unused_tracks = job['total'] - job['completed']
-                    refund_unused_credits(item.get('user_id'), item.get('payment_method'), unused_tracks)
-                    break
-        except: pass
-        
-        return jsonify({"status": "cancelling"}), 200
-    return jsonify({"status": "not_found"}), 404
-
-@app.route('/download/<session_id>/<filename>')
-def download_file(session_id, filename):
-    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
-    if os.path.exists(file_path): return send_file(file_path, as_attachment=True)
-    return "File not found", 404
-
-@app.route('/health')
-def health(): return jsonify({"status": "ok"}), 200
-@app.route('/')
-def index(): return jsonify({"message": "Audio Processor API", "status": "active"}), 200
-
-if __name__ == '__main__': app.run(debug=False, port=5000, threaded=True)
+                job['error'] = 'Failed to extract audio. The link may be private
