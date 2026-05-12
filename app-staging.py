@@ -170,10 +170,10 @@ def generate_invoice():
     if user.email.startswith('anon_'):
         return jsonify({"error": "Unauthorized. Please log in first."}), 401
     payload = {
-        "price_amount": 2.00,
+        "price_amount": 5.00,
         "price_currency": "usd",
         "order_id": str(user.id), 
-        "order_description": "100 Track Conversions",
+        "order_description": "250 Track Conversions",
         "ipn_callback_url": f"{PUBLIC_URL.rstrip('/')}/webhook/nowpayments"
     }
     try:
@@ -192,7 +192,7 @@ def nowpayments_webhook():
     if data and data.get('payment_status') == 'finished':
         user = User.query.get(int(data.get('order_id')))
         if user:
-            user.paid_track_credits += 100
+            user.paid_track_credits += 250
             db.session.commit()
     return jsonify({"status": "OK"}), 200
 
