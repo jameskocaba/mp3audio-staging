@@ -104,7 +104,6 @@ def get_or_create_user():
     return ghost_user
 
 def refund_unused_credits(user_id, payment_method, unused_tracks):
-    """Refunds credits back to the user if tracks failed, were skipped, or cancelled."""
     if unused_tracks > 0 and user_id and payment_method:
         try:
             with app.app_context():
@@ -273,7 +272,6 @@ def generate_diy_manual(transcript_text_path, job=None):
         return manual_path, pdf_path, manual_html
     except: return None, None, None
 
-# ----------- FULLY RESTORED ORIGINAL PROCESS_TRACK FUNCTION -----------
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio):
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'): return False
@@ -336,7 +334,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         
         if job.get('cancelled'): return False
 
-        # CRITICAL RESTORATION: This fetches dynamic SC tokens before download
         try:
             with YoutubeDL({'quiet':True, 'no_warnings':True, 'socket_timeout':10}) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -352,7 +349,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if mp3_files:
             file_to_zip = mp3_files[0]
 
-            # CRITICAL RESTORATION: Manual FFmpeg metadata overwrite to fix corrupt SC files
             try:
                 cmd = [
                     ffmpeg_exe, '-y', '-i', file_to_zip, 
@@ -389,9 +385,37 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             job['sub_progress'] = 100
             job['completed_tracks'].append(clean_name)
             return True
+        else:
+            if not job.get('cancelled'):
+                job['skipped'] += 1
+                job['last_track_error'] = "Download finished, but no MP3 file was created."
+                job['failed_track_details'].append({
+                    "track": track_name or f"Track {track_index}",
+                    "reason": "Corrupted stream or missing audio track."
+                })
+            return False
+
     except Exception as e:
-        if not job.get('cancelled'): job['skipped'] += 1
+        if not job.get('cancelled'): 
+            job['skipped'] += 1
+            error_string = str(e)
+            job['last_track_error'] = error_string
+            
+            if "404" in error_string:
+                friendly_reason = "Private, deleted, or invalid track link."
+            elif "403" in error_string:
+                friendly_reason = "Geo-blocked or access denied by platform."
+            elif "ffmpeg" in error_string.lower():
+                friendly_reason = "Server audio processor (FFmpeg) missing."
+            else:
+                friendly_reason = "Unsupported format or protected track."
+
+            job['failed_track_details'].append({
+                "track": track_name or f"Track {track_index}",
+                "reason": friendly_reason
+            })
         return False
+        
     finally:
         try:
             for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
@@ -399,8 +423,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 except: pass
         except: pass
         cleanup_memory()
-# ----------------------------------------------------------------------
-
 
 def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None, transcribe_audio=False, user_id=None, payment_method=None):
     global current_processing_session
@@ -421,9 +443,10 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
         if not job.get('cancelled'):
             if job['completed'] == 0:
                 job['status'] = 'error'
+                hidden_error = job.get('last_track_error', 'Unknown internal error.')
                 job['error'] = (
                     "Failed to extract audio. "
-                    "The link may be private, unsupported, or geo-blocked."
+                    f"System Output: {hidden_error}"
                 )
             else:
                 job['status'] = 'completed'
@@ -485,9 +508,8 @@ def start_conversion():
             for i, e in enumerate(entries[:MAX_SONGS]):
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    # CRITICAL RESTORATION: Fixed fallback URL formatting
                     if not track_url.startswith('http') and 'soundcloud' in url: 
-                        track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
+                        track_url = f"https://api.soundcloud.com/tracks/{e.get('id', i)}"
                     elif not track_url.startswith('http'): continue 
                     valid_entries.append((i+1, track_url, e.get('title', f"Track {i+1}"), e.get('uploader', 'Artist'), e.get('thumbnail', '')))
             total_tracks = len(valid_entries)
@@ -512,8 +534,9 @@ def start_conversion():
 
         conversion_jobs[session_id] = {
             'status': 'queued', 'total': total_tracks, 'completed': 0, 'skipped': 0, 'current_track': 0, 
-            'completed_tracks': [], 'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
-            'current_thumbnail': '', 'last_update': time.time(), 'email_summaries': '', 'sub_progress': 0 
+            'completed_tracks': [], 'skipped_tracks': [], 'failed_track_details': [],
+            'cancelled': False, 'zip_ready': False, 'current_thumbnail': '', 
+            'last_update': time.time(), 'email_summaries': '', 'sub_progress': 0 
         }
         
         conversion_queue.append({
@@ -542,12 +565,20 @@ def get_status(session_id):
             wait_seconds += (len(item['entries']) * AVG_TIME_PER_TRACK)
     
     return jsonify({
-        "status": job['status'], "total": job['total'], "completed": job['completed'], "skipped": job['skipped'], 
-        "current_track": job['current_track'], "current_status": job.get('current_status', ''), 
-        "current_thumbnail": job.get('current_thumbnail', ''), "zip_ready": job.get('zip_ready', False),
-        "zip_path": job.get('zip_path', ''), "sub_progress": job.get('sub_progress', 0),
+        "status": job['status'], 
+        "total": job['total'], 
+        "completed": job['completed'], 
+        "skipped": job['skipped'], 
+        "failed_details": job.get('failed_track_details', []),
+        "current_track": job['current_track'], 
+        "current_status": job.get('current_status', ''), 
+        "current_thumbnail": job.get('current_thumbnail', ''), 
+        "zip_ready": job.get('zip_ready', False),
+        "zip_path": job.get('zip_path', ''), 
+        "sub_progress": job.get('sub_progress', 0),
         "error": job.get('error', ''), 
-        "queue_position": queue_pos, "estimated_wait": math.ceil(wait_seconds / 60)
+        "queue_position": queue_pos, 
+        "estimated_wait": math.ceil(wait_seconds / 60)
     }), 200
 
 @app.route('/cancel', methods=['POST'])
